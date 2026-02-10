@@ -269,6 +269,20 @@ SEND_CELL_VOLTAGES: int = get_int_from_config("DEFAULT", "SEND_CELL_VOLTAGES")
 LOG_PERIOD: int = get_int_from_config("DEFAULT", "LOG_PERIOD")
 
 
+# ----- SmartShunt Per-Battery Association (Learning Mode) -----
+SMARTSHUNT_LEARNING_MODE: bool = get_bool_from_config("DEFAULT", "SMARTSHUNT_LEARNING_MODE")
+SMARTSHUNT_AUTO_RECORD: bool = get_bool_from_config("DEFAULT", "SMARTSHUNT_AUTO_RECORD")
+SMARTSHUNT_DEFAULT_ROLE: str = config["DEFAULT"].get("SMARTSHUNT_DEFAULT_ROLE", "soc_authoritative")
+SMARTSHUNT_MIN_CONFIDENCE: int = get_int_from_config("DEFAULT", "SMARTSHUNT_MIN_CONFIDENCE")
+if SMARTSHUNT_MIN_CONFIDENCE == 0:
+    SMARTSHUNT_MIN_CONFIDENCE = 150
+SMARTSHUNT_VALIDATE_INTERVAL: int = get_int_from_config("DEFAULT", "SMARTSHUNT_VALIDATE_INTERVAL")
+if SMARTSHUNT_VALIDATE_INTERVAL == 0:
+    SMARTSHUNT_VALIDATE_INTERVAL = 3600
+SMARTSHUNT_AUTO_VOLTAGE_TOLERANCE: float = get_float_from_config("DEFAULT", "SMARTSHUNT_AUTO_VOLTAGE_TOLERANCE", 0.5)
+SMARTSHUNT_AUTO_CAPACITY_TOLERANCE: float = get_float_from_config("DEFAULT", "SMARTSHUNT_AUTO_CAPACITY_TOLERANCE", 20.0)
+
+
 # print errors and exit if there are any
 if errors_in_config:
     logging.error("Errors in config file:")
@@ -286,3 +300,6 @@ logging.info("|- NR_OF_BATTERIES: %d" % NR_OF_BATTERIES)
 logging.info("|- NR_OF_CELLS_PER_BATTERY: %d" % NR_OF_CELLS_PER_BATTERY)
 logging.info("|- UPDATE_INTERVAL_FIND_DEVICES: %d s" % UPDATE_INTERVAL_FIND_DEVICES)
 logging.info("|- UPDATE_INTERVAL_DATA: %d s" % UPDATE_INTERVAL_DATA)
+if SMARTSHUNT_LEARNING_MODE:
+    logging.info("|- SMARTSHUNT_LEARNING_MODE: Enabled")
+    logging.info("|- SMARTSHUNT_MIN_CONFIDENCE: %d" % SMARTSHUNT_MIN_CONFIDENCE)
