@@ -439,6 +439,19 @@ class DbusAggBatService(object):
                         logging.info("   |- Custom name:  %s" % self._dbusMon.dbusmon.get_value(service, "/CustomName"))
                         logging.info("   |- Product name: %s" % self._dbusMon.dbusmon.get_value(service, "/ProductName"))
 
+                        # Log battery identity details
+                        try:
+                            battery_serial = self._dbusMon.dbusmon.get_value(service, "/Serial")
+                            battery_vrm = self._dbusMon.dbusmon.get_value(service, "/DeviceInstance")
+                            battery_capacity = self._dbusMon.dbusmon.get_value(service, "/InstalledCapacity")
+                            if battery_serial:
+                                logging.info("   |- Serial: %s" % battery_serial)
+                            if battery_vrm:
+                                logging.info("   |- VRM ID: %s" % battery_vrm)
+                            logging.info("   |- Capacity: %s Ah" % battery_capacity)
+                        except Exception:
+                            pass
+
                         # Resolve SmartShunt association (learning mode)
                         if settings.SMARTSHUNT_LEARNING_MODE:
                             shunt_service, role, source = self._resolve_battery_smartshunt(service, BatteryName)
@@ -1556,6 +1569,31 @@ class DbusAggBatService(object):
                     MaxCellVoltage - MinCellVoltage,
                 )
             )
+
+            # Log SmartShunt association status if learning mode is enabled
+            if settings.SMARTSHUNT_LEARNING_MODE and hasattr(self, '_battery_smartshunt_assoc') and self._battery_smartshunt_assoc:
+                logging.info("|- SmartShunt associations:")
+                for battery_name, assoc in self._battery_smartshunt_assoc.items():
+                    if assoc.get("shunt_service"):
+                        logging.info("   |- %s: SmartShunt %s (role: %s, source: %s)" % (
+                            battery_name,
+                            assoc.get("shunt_service", "?").split(".")[-1][:20],
+                            assoc.get("role", "?"),
+                            assoc.get("source", "?")
+                        ))
+                    else:
+                        logging.info("   |- %s: No SmartShunt (using BMS data)" % battery_name)
+
+            # Log SoC source summary
+            if not settings.OWN_SOC:
+                if settings.SMARTSHUNT_LEARNING_MODE and hasattr(self, '_battery_smartshunt_assoc') and self._battery_smartshunt_assoc:
+                    bms_count = len(self._batteries_dict) - len([a for a in self._battery_smartshunt_assoc.values() if a.get("shunt_service")])
+                    shunt_count = len([a for a in self._battery_smartshunt_assoc.values() if a.get("shunt_service")])
+                    logging.info("|- SoC sources: %d BMS, %d SmartShunt" % (bms_count, shunt_count))
+                else:
+                    logging.info("|- SoC source: BMS weighted average (%d batteries)" % len(self._batteries_dict))
+            else:
+                logging.info("|- SoC source: Internal Coulomb counter")
 
         return True
 
