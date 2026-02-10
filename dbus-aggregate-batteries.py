@@ -32,6 +32,9 @@ import time as tt
 from dbusmon import DbusMon
 from threading import Thread
 
+# for SmartShunt association persistence
+import json
+
 # add ext folder to sys.path
 sys.path.insert(1, os.path.join(os.path.dirname(__file__), "ext"))
 
@@ -73,6 +76,10 @@ class DbusAggBatService(object):
         # store list of SmartShunts as specified in settings.py
         self._smartShunt_list = []
         """ list of dbus services of SmartShunts, if found """
+
+        # Per-battery SmartShunt associations (learning mode)
+        self._battery_smartshunt_assoc = {}
+        """ dictionary mapping battery names to their SmartShunt association info """
 
         # Initialize tread as None
         self._dbusMon = None
@@ -432,6 +439,20 @@ class DbusAggBatService(object):
                         logging.info("   |- Custom name:  %s" % self._dbusMon.dbusmon.get_value(service, "/CustomName"))
                         logging.info("   |- Product name: %s" % self._dbusMon.dbusmon.get_value(service, "/ProductName"))
 
+                        # Resolve SmartShunt association (learning mode)
+                        if settings.SMARTSHUNT_LEARNING_MODE:
+                            shunt_service, role, source = self._resolve_battery_smartshunt(service, BatteryName)
+                            if shunt_service:
+                                # Store association metadata separately
+                                if not hasattr(self, '_battery_smartshunt_assoc'):
+                                    self._battery_smartshunt_assoc = {}
+                                self._battery_smartshunt_assoc[BatteryName] = {
+                                    "shunt_service": shunt_service,
+                                    "role": role,
+                                    "source": source
+                                }
+                                logging.info("   |- SmartShunt association: %s (role: %s, source: %s)" % (shunt_service, role, source))
+
                         batteriesCount += 1
 
                         # accumulate battery capacities and Soc if not read from charge file
@@ -692,6 +713,184 @@ class DbusAggBatService(object):
             logging.error("Required number of MPPTs not found. Exiting...")
             tt.sleep(settings.TIME_BEFORE_RESTART)
             sys.exit(1)
+
+    # #################################################################################
+    # ### SmartShunt Per-Battery Association Methods (Learning Mode) ##################
+    # #################################################################################
+
+    def _load_battery_associations(self):
+        """Load battery-to-SmartShunt associations from persistent storage."""
+        assoc_file = "/data/apps/dbus-aggregate-batteries/battery_associations.json"
+        try:
+            with open(assoc_file, "r") as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
+    def _save_battery_associations(self, associations):
+        """Save battery-to-SmartShunt associations to persistent storage."""
+        assoc_file = "/data/apps/dbus-aggregate-batteries/battery_associations.json"
+        try:
+            os.makedirs(os.path.dirname(assoc_file), exist_ok=True)
+            with open(assoc_file, "w") as f:
+                json.dump(associations, f, indent=2)
+        except Exception as e:
+            logging.error(f"Failed to save battery associations: {e}")
+
+    def _record_battery_detection(self, battery_serial, battery_vrm, battery_capacity, shunt_vrm=None, shunt_name=None, confidence=0, status="unknown"):
+        """Record a battery detection to the associations file."""
+        if not battery_serial or not settings.SMARTSHUNT_AUTO_RECORD:
+            return
+
+        stored = self._load_battery_associations()
+
+        if battery_serial not in stored:
+            stored[battery_serial] = {
+                "battery_vrm": battery_vrm,
+                "battery_capacity": battery_capacity,
+                "shunt_vrm": shunt_vrm,
+                "shunt_name": shunt_name,
+                "detected_at": dt.now().isoformat(),
+                "confidence": confidence,
+                "status": status
+            }
+            if status == "unknown":
+                stored[battery_serial]["note"] = "No SmartShunt match found. Manually edit this entry to add shunt_vrm or shunt_name."
+            elif status == "tentative":
+                stored[battery_serial]["note"] = "Low confidence match - verify and change status to manual to enable"
+
+            self._save_battery_associations(stored)
+            logging.info(f"RECORDED: Battery {battery_serial} -> status: {status}" + (f" (confidence: {confidence}%)" if confidence > 0 else ""))
+
+    def _find_smartshunt_by_vrm(self, vrm_id):
+        """Find a SmartShunt by its VRM instance ID."""
+        for shunt_service in self._smartShunt_list:
+            try:
+                shunt_vrm = self._dbusMon.dbusmon.get_value(shunt_service, "/DeviceInstance")
+                if shunt_vrm == vrm_id:
+                    return shunt_service
+            except Exception:
+                continue
+        return None
+
+    def _find_smartshunt_by_name(self, name):
+        """Find a SmartShunt by its custom name."""
+        for shunt_service in self._smartShunt_list:
+            try:
+                shunt_name = self._dbusMon.dbusmon.get_value(shunt_service, settings.SMARTSHUNT_INSTANCE_NAME_PATH)
+                if shunt_name == name:
+                    return shunt_service
+            except Exception:
+                continue
+        return None
+
+    def _find_smartshunt_by_fingerprint(self, battery_service):
+        """
+        Find best-matching SmartShunt using capacity + voltage fingerprinting.
+        Returns (shunt_service, confidence_score) or (None, 0)
+        """
+        try:
+            battery_voltage = self._dbusMon.dbusmon.get_value(battery_service, "/Dc/0/Voltage")
+            battery_capacity = self._dbusMon.dbusmon.get_value(battery_service, "/InstalledCapacity")
+        except Exception:
+            return None, 0
+
+        if battery_voltage is None or battery_capacity is None:
+            return None, 0
+
+        best_match = None
+        best_score = -1
+
+        for shunt_service in self._smartShunt_list[:self._num_battery_shunts]:
+            try:
+                shunt_voltage = self._dbusMon.dbusmon.get_value(shunt_service, "/Dc/0/Voltage")
+                shunt_capacity = self._dbusMon.dbusmon.get_value(shunt_service, "/InstalledCapacity")
+            except Exception:
+                continue
+
+            if shunt_voltage is None or shunt_capacity is None:
+                continue
+
+            # Capacity matching (strong signal)
+            capacity_diff_pct = abs(battery_capacity - shunt_capacity) / battery_capacity * 100
+            if capacity_diff_pct > settings.SMARTSHUNT_AUTO_CAPACITY_TOLERANCE:
+                continue
+            capacity_score = max(0, 100 - capacity_diff_pct * 5)
+
+            # Voltage matching (weaker signal)
+            voltage_diff = abs(battery_voltage - shunt_voltage)
+            if voltage_diff > settings.SMARTSHUNT_AUTO_VOLTAGE_TOLERANCE:
+                voltage_score = max(0, 100 - voltage_diff * 100)
+            else:
+                voltage_score = 100
+
+            # Combined score: capacity weighted 2x
+            total_score = (capacity_score * 2) + voltage_score
+
+            if total_score > best_score:
+                best_score = total_score
+                best_match = shunt_service
+
+        return best_match, best_score
+
+    def _resolve_battery_smartshunt(self, battery_service, battery_name):
+        """
+        Resolve SmartShunt association for a battery.
+        Returns (shunt_service, role, source) or (None, None, None)
+        """
+        try:
+            battery_serial = self._dbusMon.dbusmon.get_value(battery_service, "/Serial")
+            battery_vrm = self._dbusMon.dbusmon.get_value(battery_service, "/DeviceInstance")
+            battery_capacity = self._dbusMon.dbusmon.get_value(battery_service, "/InstalledCapacity")
+        except Exception:
+            battery_serial = None
+            battery_vrm = None
+            battery_capacity = None
+
+        # Load stored associations
+        stored = self._load_battery_associations()
+
+        # Check if already recorded
+        if battery_serial and battery_serial in stored:
+            assoc = stored[battery_serial]
+            if assoc.get("status") == "unknown":
+                return None, None, "unknown_pending"
+            if assoc.get("status") in ["auto_learned", "manual"]:
+                shunt_vrm = assoc.get("shunt_vrm")
+                if shunt_vrm:
+                    shunt_service = self._find_smartshunt_by_vrm(shunt_vrm)
+                    if shunt_service:
+                        role = assoc.get("role", settings.SMARTSHUNT_DEFAULT_ROLE)
+                        return shunt_service, role, assoc.get("status")
+
+        # Auto-detection (learning mode)
+        if settings.SMARTSHUNT_LEARNING_MODE and battery_serial:
+            shunt_service, confidence = self._find_smartshunt_by_fingerprint(battery_service)
+
+            if shunt_service and confidence >= settings.SMARTSHUNT_MIN_CONFIDENCE:
+                # High-confidence match
+                role = settings.SMARTSHUNT_DEFAULT_ROLE
+                shunt_vrm = self._dbusMon.dbusmon.get_value(shunt_service, "/DeviceInstance")
+                shunt_name = self._dbusMon.dbusmon.get_value(shunt_service, settings.SMARTSHUNT_INSTANCE_NAME_PATH)
+                self._record_battery_detection(battery_serial, battery_vrm, battery_capacity,
+                                               shunt_vrm, shunt_name, confidence, "auto_learned")
+                logging.info(f"LEARNED: {battery_name} ({battery_serial}) -> SmartShunt VRM {shunt_vrm} (confidence: {confidence}%, role: {role})")
+                return shunt_service, role, "auto_learned"
+            elif shunt_service:
+                # Low-confidence match - record as tentative
+                shunt_vrm = self._dbusMon.dbusmon.get_value(shunt_service, "/DeviceInstance")
+                shunt_name = self._dbusMon.dbusmon.get_value(shunt_service, settings.SMARTSHUNT_INSTANCE_NAME_PATH)
+                self._record_battery_detection(battery_serial, battery_vrm, battery_capacity,
+                                               shunt_vrm, shunt_name, confidence, "tentative")
+                logging.warning(f"TENTATIVE: {battery_name} ({battery_serial}) -> SmartShunt VRM {shunt_vrm} (low confidence: {confidence}%). Edit JSON to confirm.")
+                return None, None, f"tentative_{confidence}"
+            else:
+                # No match found - record as unknown
+                self._record_battery_detection(battery_serial, battery_vrm, battery_capacity, status="unknown")
+                logging.info(f"UNKNOWN: {battery_name} ({battery_serial}) - No SmartShunt match. Edit battery_associations.json to add association.")
+                return None, None, "unknown"
+
+        return None, None, None
 
     # #################################################################################
     # #################################################################################
